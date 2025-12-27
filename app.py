@@ -1,15 +1,10 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import psycopg2
 import psycopg2.extras
-
 import boto3
-from datetime import datetime
 import os
 import logging
-from botocore.config import Config
-
-
 
 # Enable logging
 logging.basicConfig(level=logging.DEBUG)
@@ -21,23 +16,41 @@ app.initialized = False
 
 # ---------- DATABASE CONNECTION ----------
 def get_db_connection():
-    """Simple database connection"""
+    """Get database connection using Render's PostgreSQL or fallback"""
     try:
-        conn = psycopg2.connect(
-            host="database-1.ch86ai8iox4q.eu-north-1.rds.amazonaws.com",
-            database="postgres",
-            user="postgres",
-            password="postgres",
-            connect_timeout=5
-        )
+        # Get database URL from environment (Render provides this)
+        database_url = os.environ.get('DATABASE_URL')
+        
+        if database_url:
+            # For Render PostgreSQL
+            conn = psycopg2.connect(database_url, sslmode='require')
+        else:
+            # For local or fallback (REMOVE AWS CREDENTIALS IN PRODUCTION)
+            conn = psycopg2.connect(
+                host="database-1.ch86ai8iox4q.eu-north-1.rds.amazonaws.com",
+                database="postgres",
+                user="postgres",
+                password="postgres",
+                connect_timeout=5
+            )
         return conn
     except Exception as e:
         print(f"❌ Database error: {e}")
         return None
 
 # ---------- S3 ----------
-s3_client = boto3.client('s3', region_name='eu-north-1')
-BUCKET = "dental-clinic-reports-1"
+# Use environment variables for AWS credentials
+try:
+    s3_client = boto3.client(
+        's3',
+        region_name='eu-north-1',
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', ''),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+    )
+    BUCKET = "dental-clinic-reports-1"
+except:
+    s3_client = None
+    print("⚠️ S3 not configured - AWS credentials missing")
 
 # ---------- CREATE TABLES ----------
 def create_tables():
@@ -79,6 +92,7 @@ def create_tables():
             patient_id INTEGER REFERENCES patients(id),
             test_name VARCHAR(255),
             status VARCHAR(50) DEFAULT 'Pending',
+            filename VARCHAR(255),
             s3_key VARCHAR(500),
             upload_date TIMESTAMP,
             requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -117,19 +131,16 @@ def initialize():
 
 @app.route('/')
 def home():
-    return send_from_directory('patient', 'patient-login.html')
-
-@app.route('/css/<path:filename>')
-def serve_css(filename):
-    return send_from_directory('css', filename)
-
-@app.route('/patient/<path:filename>')
-def serve_patient(filename):
-    return send_from_directory('patient', filename)
-
-@app.route('/admin/<path:filename>')
-def serve_admin(filename):
-    return send_from_directory('admin', filename)
+    return jsonify({
+        "message": "Dental Clinic API is running",
+        "endpoints": {
+            "health": "/health",
+            "patient_register": "/patient/register",
+            "patient_login": "/patient/login",
+            "book_appointment": "/book-appointment",
+            "request_report": "/request-report"
+        }
+    })
 
 # ---------- PATIENT ----------
 @app.route('/patient/register', methods=['POST'])
@@ -273,7 +284,6 @@ def submit_report_request():
         if conn:
             conn.close()
 
-
 @app.route('/admin/report-requests')
 def get_report_requests():
     print("📋 Admin: Fetching report requests...")
@@ -333,10 +343,6 @@ def get_report_requests():
                 "s3_key": row[7]
             })
 
-        # Print first few for debugging
-        for i, req in enumerate(requests[:3]):
-            print(f"  {i+1}. {req['patient_name']} - {req['test_name']} - {req['status']}")
-
         return jsonify(requests)
 
     except Exception as e:
@@ -390,7 +396,7 @@ def get_reports(patient_id):
             download_url = None
 
             # Generate download URL ONLY if uploaded
-            if status == 'Uploaded' and row['s3_key']:
+            if status == 'Uploaded' and row['s3_key'] and s3_client:
                 try:
                     download_url = s3_client.generate_presigned_url(
                         'get_object',
@@ -425,9 +431,6 @@ def get_reports(patient_id):
             cur.close()
         if conn:
             conn.close()
-
-
-
 
 # ---------- ADMIN ----------
 @app.route('/admin/login', methods=['POST'])
@@ -487,6 +490,12 @@ def get_appointments():
 
 @app.route('/generate-upload-url', methods=['POST'])
 def generate_upload_url():
+    if not s3_client:
+        return jsonify({
+            'success': False,
+            'error': 'S3 not configured'
+        }), 500
+
     data = request.json
     patient_id = data.get('patient_id')
     test_name = data.get('test_name')
@@ -515,7 +524,8 @@ def generate_upload_url():
     return jsonify({
         'success': True,
         'upload_url': upload_url,
-        's3_key': s3_key  # <-- THIS IS CRITICAL!
+        's3_key': s3_key,
+        'filename': filename
     })
 
 @app.route('/upload-report', methods=['POST'])
@@ -569,8 +579,6 @@ def upload_report():
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
-
 @app.route('/admin/update-appointment-status', methods=['POST'])
 def update_appointment_status():
     """Update appointment status (Complete/Cancel/Booked)"""
@@ -614,7 +622,12 @@ def update_appointment_status():
 # ---------- HEALTH ----------
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "service": "dental-clinic-api",
+        "database": "check /health/db",
+        "s3": "check /health/s3"
+    })
 
 @app.route('/health/db')
 def health_db():
@@ -626,14 +639,16 @@ def health_db():
 
 @app.route('/health/s3')
 def health_s3():
-    try:
-        s3_client.list_buckets()
-        return jsonify({"s3": "connected"})
-    except Exception as e:
-        return jsonify({"s3": "error", "details": str(e)}), 500
-
+    if s3_client:
+        try:
+            s3_client.list_buckets()
+            return jsonify({"s3": "connected"})
+        except Exception as e:
+            return jsonify({"s3": "error", "details": str(e)}), 500
+    else:
+        return jsonify({"s3": "not_configured"}), 500
 
 # ---------- RUN ----------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port)
